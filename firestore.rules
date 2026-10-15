@@ -1,0 +1,157 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Funções auxiliares ----------
+    function logado() {
+      return request.auth != null;
+    }
+
+    function ehSuperAdmin() {
+      return logado() && exists(/databases/$(database)/documents/superadmins/$(request.auth.uid));
+    }
+
+    function temPerfil() {
+      return logado() && exists(/databases/$(database)/documents/usuarios/$(request.auth.uid));
+    }
+
+    function perfil() {
+      return get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data;
+    }
+
+    // O usuário pertence a esta loja (mesmo que esteja desativado)
+    function membro(lojaId) {
+      return temPerfil() && perfil().lojaId == lojaId;
+    }
+
+    function lojaAtiva(lojaId) {
+      return get(/databases/$(database)/documents/lojas/$(lojaId)).data.get('ativo', true) != false;
+    }
+
+    // Pertence à loja, está ativo e a loja está ativa
+    function daLoja(lojaId) {
+      return membro(lojaId) && perfil().get('ativo', true) != false && lojaAtiva(lojaId);
+    }
+
+    function ehDono(lojaId) {
+      return daLoja(lojaId) && perfil().cargo == 'dono';
+    }
+
+    function ehVendedor(lojaId) {
+      return daLoja(lojaId) && perfil().cargo == 'vendedor';
+    }
+
+    function ehTecnico(lojaId) {
+      return daLoja(lojaId) && perfil().cargo == 'tecnico';
+    }
+
+    function donoOuVendedor(lojaId) {
+      return ehDono(lojaId) || ehVendedor(lojaId);
+    }
+
+    // ---------- Super Admin ----------
+    // Criado manualmente no console. Ninguém consegue escrever aqui pelo app.
+    match /superadmins/{uid} {
+      allow read: if logado() && (request.auth.uid == uid || ehSuperAdmin());
+      allow write: if false;
+    }
+
+    // ---------- Usuários ----------
+    match /usuarios/{uid} {
+      allow read: if logado() && (
+        request.auth.uid == uid ||
+        ehSuperAdmin() ||
+        ehDono(resource.data.lojaId)
+      );
+
+      allow create: if ehSuperAdmin() || (
+        ehDono(request.resource.data.lojaId) &&
+        request.resource.data.cargo in ['vendedor', 'tecnico']
+      );
+
+      allow update: if ehSuperAdmin() || (
+        ehDono(resource.data.lojaId) &&
+        request.resource.data.lojaId == resource.data.lojaId &&
+        resource.data.cargo != 'dono' &&
+        request.resource.data.cargo in ['vendedor', 'tecnico']
+      );
+
+      allow delete: if ehSuperAdmin();
+    }
+
+    // ---------- Lojas (cada loja isolada pelo seu ID) ----------
+    match /lojas/{lojaId} {
+      allow read: if ehSuperAdmin() || membro(lojaId);
+      allow write: if ehSuperAdmin();
+
+      // Contador sequencial da OS
+      match /configuracoes/{docId} {
+        allow read: if daLoja(lojaId);
+
+        allow create: if ehSuperAdmin() || (
+          donoOuVendedor(lojaId) &&
+          docId == 'geral' &&
+          request.resource.data.contadorOS == 1
+        );
+
+        allow update: if ehSuperAdmin() || (
+          donoOuVendedor(lojaId) &&
+          docId == 'geral' &&
+          request.resource.data.contadorOS == resource.data.contadorOS + 1
+        );
+
+        allow delete: if ehSuperAdmin();
+      }
+
+      // Ordens de serviço
+      match /ordens/{osId} {
+        allow read: if daLoja(lojaId);
+        allow create: if donoOuVendedor(lojaId);
+        allow update: if (donoOuVendedor(lojaId) || ehTecnico(lojaId)) &&
+          request.resource.data.numeroOS == resource.data.numeroOS;
+        allow delete: if ehDono(lojaId);
+      }
+
+      // Estoque (técnico não acessa)
+      match /estoque/{produtoId} {
+        allow read: if donoOuVendedor(lojaId);
+        allow create, delete: if ehDono(lojaId);
+        allow update: if ehDono(lojaId) || (
+          ehVendedor(lojaId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['quantidade'])
+        );
+      }
+
+      // Vendas: dono vê todas, vendedor vê só as suas
+      match /vendas/{vendaId} {
+        allow read: if ehDono(lojaId) || (ehVendedor(lojaId) && resource.data.usuarioUid == request.auth.uid);
+        allow create: if donoOuVendedor(lojaId) && request.resource.data.usuarioUid == request.auth.uid;
+        allow update, delete: if false;
+      }
+
+      // Caixa
+      match /caixaSessoes/{sessaoId} {
+        allow read: if donoOuVendedor(lojaId);
+        allow create, update: if donoOuVendedor(lojaId);
+        allow delete: if false;
+      }
+
+      match /caixaMovimentos/{movId} {
+        allow read: if donoOuVendedor(lojaId);
+        allow create: if donoOuVendedor(lojaId) && request.resource.data.usuarioUid == request.auth.uid;
+        allow update, delete: if false;
+      }
+
+      // RH: somente o dono
+      match /equipe/{lancId} {
+        allow read, write: if ehDono(lojaId);
+      }
+    }
+
+    // Qualquer outro caminho é bloqueado
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
